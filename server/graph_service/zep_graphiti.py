@@ -3,20 +3,54 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException
 from graphiti_core import Graphiti  # type: ignore
+from graphiti_core.driver.driver import GraphDriver  # type: ignore
 from graphiti_core.edges import EntityEdge  # type: ignore
 from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError, NodeNotFoundError
 from graphiti_core.llm_client import LLMClient  # type: ignore
 from graphiti_core.nodes import EntityNode, EpisodicNode  # type: ignore
 
-from graph_service.config import ZepEnvDep
+from graph_service.config import Settings, ZepEnvDep
 from graph_service.dto import FactResult
 
 logger = logging.getLogger(__name__)
 
 
+def create_graph_driver(settings: Settings) -> GraphDriver:
+    """Create the appropriate graph driver based on DATABASE_PROVIDER setting."""
+    if settings.database_provider == 'falkordb':
+        from graphiti_core.driver.falkordb_driver import FalkorDriver
+
+        # Prefer public host for external connections (local dev), fall back to internal
+        host = settings.falkor_public_host or settings.falkor_host
+        port = settings.falkor_public_port or settings.falkor_port
+
+        if not host:
+            raise ValueError('FalkorDB host not configured. Set FALKOR_HOST or FALKOR_PUBLIC_HOST')
+
+        return FalkorDriver(
+            host=host,
+            port=port,
+            username=settings.falkor_username,
+            password=settings.falkor_password,
+            database=settings.falkor_database,
+        )
+    else:
+        # Neo4j (default)
+        from graphiti_core.driver.neo4j_driver import Neo4jDriver
+
+        if not settings.neo4j_uri or not settings.neo4j_user or not settings.neo4j_password:
+            raise ValueError('Neo4j credentials not fully configured')
+
+        return Neo4jDriver(
+            settings.neo4j_uri,
+            settings.neo4j_user,
+            settings.neo4j_password,
+        )
+
+
 class ZepGraphiti(Graphiti):
-    def __init__(self, uri: str, user: str, password: str, llm_client: LLMClient | None = None):
-        super().__init__(uri, user, password, llm_client)
+    def __init__(self, graph_driver: GraphDriver, llm_client: LLMClient | None = None):
+        super().__init__(graph_driver=graph_driver, llm_client=llm_client)
 
     async def save_entity_node(self, name: str, uuid: str, group_id: str, summary: str = ''):
         new_node = EntityNode(
@@ -72,11 +106,9 @@ class ZepGraphiti(Graphiti):
 
 
 async def get_graphiti(settings: ZepEnvDep):
-    client = ZepGraphiti(
-        uri=settings.neo4j_uri,
-        user=settings.neo4j_user,
-        password=settings.neo4j_password,
-    )
+    driver = create_graph_driver(settings)
+    client = ZepGraphiti(graph_driver=driver)
+
     if settings.openai_base_url is not None:
         client.llm_client.config.base_url = settings.openai_base_url
     if settings.openai_api_key is not None:
@@ -90,13 +122,11 @@ async def get_graphiti(settings: ZepEnvDep):
         await client.close()
 
 
-async def initialize_graphiti(settings: ZepEnvDep):
-    client = ZepGraphiti(
-        uri=settings.neo4j_uri,
-        user=settings.neo4j_user,
-        password=settings.neo4j_password,
-    )
+async def initialize_graphiti(settings: Settings):
+    driver = create_graph_driver(settings)
+    client = ZepGraphiti(graph_driver=driver)
     await client.build_indices_and_constraints()
+    await client.close()
 
 
 def get_fact_result_from_edge(edge: EntityEdge):
