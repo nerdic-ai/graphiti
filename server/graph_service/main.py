@@ -12,9 +12,11 @@ from graph_service.zep_graphiti import initialize_graphiti
 async def lifespan(_: FastAPI):
     settings = get_settings()
     await initialize_graphiti(settings)
+    # Start the async worker for background message processing
+    await ingest.async_worker.start()
     yield
     # Shutdown
-    # No need to close Graphiti here, as it's handled per-request
+    await ingest.async_worker.stop()
 
 
 app = FastAPI(lifespan=lifespan)
