@@ -1,62 +1,83 @@
 import asyncio
-from contextlib import asynccontextmanager
-from functools import partial
+import contextlib
+import logging
+from dataclasses import dataclass
 
-from fastapi import APIRouter, FastAPI, status
+from fastapi import APIRouter, status
 from graphiti_core.nodes import EpisodeType  # type: ignore
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data  # type: ignore
 
+from graph_service.config import get_settings
 from graph_service.dto import AddEntityNodeRequest, AddMessagesRequest, Message, Result
-from graph_service.zep_graphiti import ZepGraphitiDep
+from graph_service.zep_graphiti import ZepGraphiti, ZepGraphitiDep, create_graph_driver
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MessageJob:
+    """Data class to hold message processing job details."""
+
+    message: Message
+    group_id: str
 
 
 class AsyncWorker:
     def __init__(self):
-        self.queue = asyncio.Queue()
+        self.queue: asyncio.Queue[MessageJob] = asyncio.Queue()
         self.task = None
-
-    async def worker(self):
-        while True:
-            try:
-                print(f'Got a job: (size of remaining queue: {self.queue.qsize()})')
-                job = await self.queue.get()
-                await job()
-            except asyncio.CancelledError:
-                break
+        self._graphiti: ZepGraphiti | None = None
 
     async def start(self):
+        # Create a persistent graphiti client for the worker
+        settings = get_settings()
+        driver = create_graph_driver(settings)
+        self._graphiti = ZepGraphiti(graph_driver=driver)
+
+        # Configure LLM client
+        if settings.openai_base_url is not None:
+            self._graphiti.llm_client.config.base_url = settings.openai_base_url
+        if settings.openai_api_key is not None:
+            self._graphiti.llm_client.config.api_key = settings.openai_api_key
+        if settings.model_name is not None:
+            self._graphiti.llm_client.model = settings.model_name
+
         self.task = asyncio.create_task(self.worker())
 
     async def stop(self):
         if self.task:
             self.task.cancel()
-            await self.task
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.task
         while not self.queue.empty():
             self.queue.get_nowait()
+        if self._graphiti:
+            await self._graphiti.close()
+            self._graphiti = None
 
+    async def worker(self):
+        while True:
+            try:
+                job = await self.queue.get()
+                logger.info(f'Processing job (queue size: {self.queue.qsize()})')
+                print(f'Processing job (queue size: {self.queue.qsize()})')
+                await self._process_message(job)
+                logger.info('Job completed successfully')
+                print('Job completed successfully')
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f'Error processing job: {e}')
+                print(f'Error processing job: {e}')
 
-async_worker = AsyncWorker()
+    async def _process_message(self, job: MessageJob):
+        if not self._graphiti:
+            raise RuntimeError('Graphiti client not initialized')
 
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    await async_worker.start()
-    yield
-    await async_worker.stop()
-
-
-router = APIRouter(lifespan=lifespan)
-
-
-@router.post('/messages', status_code=status.HTTP_202_ACCEPTED)
-async def add_messages(
-    request: AddMessagesRequest,
-    graphiti: ZepGraphitiDep,
-):
-    async def add_messages_task(m: Message):
-        await graphiti.add_episode(
+        m = job.message
+        await self._graphiti.add_episode(
             uuid=m.uuid,
-            group_id=request.group_id,
+            group_id=job.group_id,
             name=m.name,
             episode_body=f'{m.role or ""}({m.role_type}): {m.content}',
             reference_time=m.timestamp,
@@ -64,8 +85,21 @@ async def add_messages(
             source_description=m.source_description,
         )
 
+
+async_worker = AsyncWorker()
+
+
+router = APIRouter()
+
+
+@router.post('/messages', status_code=status.HTTP_202_ACCEPTED)
+async def add_messages(
+    request: AddMessagesRequest,
+    graphiti: ZepGraphitiDep,  # Keep for API consistency, but not used for async processing
+):
     for m in request.messages:
-        await async_worker.queue.put(partial(add_messages_task, m))
+        job = MessageJob(message=m, group_id=request.group_id)
+        await async_worker.queue.put(job)
 
     return Result(message='Messages added to processing queue', success=True)
 
