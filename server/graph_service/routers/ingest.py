@@ -75,10 +75,12 @@ class AsyncWorker:
             raise RuntimeError('Graphiti client not initialized')
 
         m = job.message
+        # Note: Don't pass uuid to add_episode for new episodes.
+        # The uuid parameter is for retrieving/updating EXISTING episodes.
+        # Graphiti will auto-generate a UUID for new episodes.
         await self._graphiti.add_episode(
-            uuid=m.uuid,
             group_id=job.group_id,
-            name=m.name,
+            name=m.name or m.uuid or '',
             episode_body=f'{m.role or ""}({m.role_type}): {m.content}',
             reference_time=m.timestamp,
             source=EpisodeType.message,
